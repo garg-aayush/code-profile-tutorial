@@ -9,25 +9,16 @@ import os
 import time
 
 import numpy as np
-import tiktoken
 import torch
 # for ddp training 
 import torch.distributed as dist
-import torch.nn.functional as F
-# for logging
-import wandb
-from hellaswag import iterate_examples, render_example
 from model import GPT, GPTConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -------------------------------------------------------------#
 # params
 # -------------------------------------------------------------#
-wandb_project = "pre-training" # wandb project name
-wandb_run_name = "gpt2-swiglu" # wandb run name
 data_root = "/workspace/shards" # data root
-ckpt_dir = "/workspace/ckpt" # checkpoint directory
-eval_interval = 250      # (steps) interval for validation and hellaSwag evaluation
 log_interval = 1         # (steps) interval for logging
 grad_norm_clip = 1.0     # global norm gradient clipping
 # data
@@ -51,14 +42,6 @@ device = "cuda"        # device to use, "cuda" or "mps" or "cpu" (DDP only for "
 seed = 42              # seed for the random number generator
 data_seed = 1337       # seed for the data shuffle
 use_compile = True    # use torch.compile to further speedup the model
-# eval
-val_loss_steps = 20        # number of steps for validation loss
-num_return_sequences = 4    # number of return sequences
-max_seq_len = 32            # maximum sequence length
-start_seq = "Hello, I'm a language model," # start sequence
-run_validation = True      # flag for running validation
-run_hellaswag = True      # flag for running hellaswag
-run_gen_samples = False      # flag for running generation samples
 # H100 SXM: 989e12 flops (bf16)
 # H100 PCIe: 756e12 flops (bf16)
 # A100: 312e12 flops (bf16)
@@ -93,7 +76,7 @@ class TrainDataLoaderLite:
         self.shards = [os.path.join(data_root, s) for s in self.shards]
         print(f"{split}: {len(self.shards)} shard(s)")
 
-        # Memory-map shards so they don’t fully load into RAM
+        # Memory-map shards so they don't fully load into RAM
         self.mem = [np.load(f, mmap_mode='r') for f in self.shards]
         self.shard_lengths = [m.shape[0] for m in self.mem]
         
@@ -155,101 +138,12 @@ class TrainDataLoaderLite:
             self._build_index()
         self.ptr = 0
 
-class ValDataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split, data_root='shards', seed=42):
-        self.B = B
-        self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        assert split in ["train", "val"], f"Invalid split: {split}"
-        self.split = split
-        self.rng = np.random.RandomState(seed+seed_offset)
-        self.eot = enc._special_tokens["<|endoftext|>"]  # end of text token
-        
-        # get the shards filenames
-        shards = [s for s in os.listdir(data_root) if self.split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        # shuffle the shards
-        self.rng.shuffle(self.shards)
-        assert len(shards) > 0, f"No shards found for split: {self.split}"
-        
-        # load the dataset
-        self.cur_shard = 0
-        self.tokens = self._load_tokens(self.shards[self.cur_shard])
-        self.cur_pos = self.process_rank * (self.B * self.T)
-
-        
-    def get_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.cur_pos : self.cur_pos + B * T + 1]
-        x = buf[:-1].view(B, T)  # input to the model
-        y = buf[1:].view(B, T)  # output of the model
-        # advance position
-        self.cur_pos += B * T * self.num_processes
-        
-        # if loading next batch is out of bounds, load the next shard
-        if self.cur_pos + B * T * self.num_processes + 1 > len(self.tokens):
-            self.cur_shard = (self.cur_shard + 1) % len(self.shards)
-            self.tokens = self._load_tokens(self.shards[self.cur_shard])
-            self.cur_pos = self.process_rank * (self.B * self.T)
-        
-        return x, y
-    
-    def _load_tokens(self, filename):
-        # memory mapping for efficiency
-        np_tensor = np.load(filename, mmap_mode='r')
-        # For validation split, return tokens as-is without shuffling
-        if self.split == "val":
-            return torch.tensor(np_tensor, dtype=torch.long)
-        else:
-            # For training split, shuffle documents to reduce temporal patterns
-            t = torch.tensor(np_tensor, dtype=torch.long)
-            # Split the token sequence into individual documents at end-of-text markers
-            doc_breaks = (t == self.eot).nonzero().flatten().tolist()
-            docs, start = [], 0 
-            # Extract each document including its EOT token
-            for end in doc_breaks:
-                docs.append(t[start:end+1])  # include EOT
-                start = end + 1
-            if start < len(t):  # last doc without trailing EOT
-                docs.append(t[start:])
-            # Randomly shuffle the order of documents to break temporal patterns
-            self.rng.shuffle(docs)
-            # Concatenate all shuffled documents back into a single tensor
-            return torch.cat(docs, dim=0)
-    def reset(self):
-        self.cur_shard = 0
-        self.tokens = self._load_tokens(self.shards[self.cur_shard])
-        self.cur_pos = self.process_rank * (self.B * self.T)
 # -------------------------------------------------------------------------#
 
 
 # -------------------------------------------------------------------------#
 # helper functions
 # -------------------------------------------------------------------------
-# copied from https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
-# HellaSwag eval
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-def get_most_likely_row(tokens, mask, logits):
-    # evaluate the autoregressive loss at all positions
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    # now get the average loss just for the completion region (where mask == 1), in each row
-    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-    masked_shift_losses = shift_losses * shift_mask
-    # sum and divide by the number of 1s in the mask
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    # now we have a loss for each of the 4 completions
-    # the one with the lowest loss should be the most likely
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
 
 # cosine decay learning-rate scheduler with warmup
 def get_lr(step):
@@ -311,12 +205,6 @@ if device_type == "cuda":  # Fixed: only set CUDA seed if using CUDA
 # use tf32
 torch.set_float32_matmul_precision("high")
 
-# create wandb run and ckpt dir
-if master_process:
-    os.makedirs(ckpt_dir, exist_ok=True)
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-    print(f"Logging to wandb, project: {wandb_project}, run: {wandb_run_name}")
-
 # get a data batch
 print("Calculate gradient accumulation steps...")
 assert total_batch % (B * T * ddp_world_size) == 0, f"Total batch size {total_batch} is not divisible by B*T*WORLD_SIZE={B * T * ddp_world_size}"
@@ -324,13 +212,8 @@ grad_accum_steps = total_batch // (B * T * ddp_world_size)
 print(f"Total desired batch size: {total_batch}")
 print(f"gradient accumulation steps: {grad_accum_steps}")
 
-# create the encoder
-print("Creating encoder...")
-enc = tiktoken.get_encoding("gpt2")
-
 # create the data loaders
 train_loader = TrainDataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", data_root=data_root, seed=data_seed)
-val_loader = ValDataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", data_root=data_root, seed=data_seed)
 
 
 # initialize the model
@@ -354,132 +237,11 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
 
-@torch.no_grad()
-def estimate_loss():
-    model.eval()
-    val_loader.reset()
-    val_loss_accum = 0.0
-    for _ in range(val_loss_steps):
-        x, y = val_loader.get_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            _, loss = model(x, y)
-        val_loss_accum += loss.detach()
-    val_loss_accum /= val_loss_steps
-    if ddp:
-        dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-    model.train()
-    return val_loss_accum.item()
-
-@torch.no_grad()
-def estimate_hella_acc():
-    model.eval()
-    num_correct_norm = 0
-    num_total = 0
-    for i, example in enumerate(iterate_examples("val")):
-        # only process examples where i % ddp_world_size == ddp_rank
-        if i % ddp_world_size != ddp_rank:
-            continue
-        # render the example into tokens and labels
-        _, tokens, mask, label = render_example(example)
-        tokens = tokens.to(device)
-        mask = mask.to(device)
-        # get the logits
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(tokens)
-        pred_norm = get_most_likely_row(tokens, mask, logits)
-        num_total += 1
-        num_correct_norm += int(pred_norm == label)
-    # reduce the stats across all processes
-    if ddp:
-        num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-        num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-        dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-        dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-        num_total = num_total.item()
-        num_correct_norm = num_correct_norm.item()
-    acc_norm = num_correct_norm / num_total
-    model.train()
-    return acc_norm, num_correct_norm, num_total
-
-@torch.no_grad()
-def generate_samples():
-    model.eval()
-    
-    # prefix the tokens
-    tokens = enc.encode(start_seq)  # 8 tokens
-    tokens = torch.tensor(tokens, dtype=torch.long)  # (8,)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)  # (5, 8) - Fixed comment
-    xgen = tokens.to(device)
-    sample_rng = torch.Generator(device=device)
-    sample_rng.manual_seed(seed + seed_offset)
-    
-    # generate the text -> x: (B,T) where B=5, T=8
-    while xgen.size(1) < max_seq_len:
-        # forward the model to get the logits
-        logits, _ = model(xgen)  # (B,T,vocab_size)
-        # logits at last position (inefficient but correct)
-        logits = logits[:, -1, :]  # (B, vocab_size)
-        # calculate probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do topk sampling of 50 (default in HF pipeline)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probs
-        ix = torch.multinomial(topk_probs, 1, generator=sample_rng)  # (B,1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
-        # append to the sequence
-        xgen = torch.cat([xgen, xcol], dim=1)
-    
-    # print the generated text
-    for i in range(num_return_sequences):
-        tokens = xgen[i, :max_seq_len].tolist()
-        decoded = enc.decode(tokens)
-        print(f"rank {ddp_rank}, sample {i}: {decoded}")
-    model.train()
-
-best_val_loss = 1e9
 running_mfu = -1.0
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
-    log_dict = {"step": step}
-    
-    # validation
-    if (step % eval_interval == 0 or last_step) and run_validation:
-        val_loss = estimate_loss()
-        if master_process:
-            print(f"validation loss: {val_loss:.4f}")
-            log_dict["val/loss"] = val_loss
 
-            # save the best model
-            if (val_loss < best_val_loss or last_step) and step > 0:
-                best_val_loss = val_loss if val_loss < best_val_loss else best_val_loss
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "best_val_loss": best_val_loss,
-                    "val_loss": val_loss,
-                    "model_args": model_args,
-                    "config": config
-                }
-                print(f"Saving model at step {step}, val_loss: {val_loss:.4f} -> best_val_loss: {best_val_loss:.4f}")
-                ckpt_name = "final_model.pt" if last_step else "best_model.pt"
-                torch.save(checkpoint, os.path.join(ckpt_dir, ckpt_name))
-    
-    # hellaswag evaluation
-    if (step % eval_interval == 0 or last_step) and run_hellaswag:
-        hella_acc_norm, num_correct_norm, num_total = estimate_hella_acc()
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={hella_acc_norm:.4f}")
-            log_dict["val/hella_norm"] = hella_acc_norm
-        
-    # generate samples from the model (except at step 0)
-    if (step % eval_interval == 0 or last_step) and run_gen_samples:
-        generate_samples()
-    
-        
     # training
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -530,17 +292,6 @@ for step in range(max_steps):
             # smooth the mfu (moving average)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"step: {step:04d}, loss: {loss_accum.item():.4f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/s: {tokens_per_second:.2f} | mfu: {running_mfu*100:.2f}%")
-        train_log_dict = {
-            "train/loss": loss_accum.item(), 
-            "train/lr": lr, 
-            "train/norm": norm.item(), 
-            "dt": dt,
-            "mfu": running_mfu,
-            "tok/s": tokens_per_second
-        }
-        # add the train/log_dict to the log_dict
-        log_dict.update(train_log_dict)
-        wandb.log(log_dict)
             
 if ddp:
     dist.destroy_process_group()
