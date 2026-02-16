@@ -1,8 +1,5 @@
 # simple run
 # python train_gpt2.py
-# ddp run
-# torchrun --nproc_per_node=<num_gpus> train_gpt2.py
-# NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=<num_gpus> train_gpt2.py # in case you get ddp error, this helped me run script on RTX6000 ada comsumer gpus
 
 import math
 import os
@@ -10,31 +7,33 @@ import time
 
 import numpy as np
 import torch
-from model import GPT, GPTConfig
+from utils.model import GPT, GPTConfig
+from utils.data import get_random_batch
 
 # -------------------------------------------------------------#
 # params
 # -------------------------------------------------------------#
-log_interval = 1         # (steps) interval for logging
 grad_norm_clip = 1.0     # global norm gradient clipping
 # data
-B = 4                 # batch size
+B = 4                   # batch size
 T = 1024                # sequence length
 # optimizer hyperparameters
 max_lr = 1.5e-3           # constant learning rate
-max_steps = 100       # total number of steps, FineWeb-Edu 10B tokens (1 epoch training 10B/ 2^19)
+warmup_steps = 10      # number of warmup steps for timing stabilization
+steps = 50             # number of steps to profile
 weight_decay = 0.1      # weight decay for optimizer
 betas = (0.9, 0.95)     # betas for optimizer
 # model
-vocab_size = 50304     # vocabulary size 50,000 merges + 256 byte pieces + 1 <endoftext> token -> nice number: 50,304
+vocab_size = 10_000     # vocabulary size 50,000 merges + 256 byte pieces + 1 <endoftext> token -> nice number: 50,304
 n_layer = 12           # number of layers
 n_embd = 768           # embedding dimension
 n_head = 12            # number of attention heads
 # system
 device = "cuda"        # device to use, "cuda" or "mps" or "cpu" (DDP only for "cuda")
 seed = 42              # seed for the random number generator
-
-use_compile = True    # use torch.compile to further speedup the model
+device_type = "cuda"
+use_compile = False    # use torch.compile to further speedup the model
+max_steps = warmup_steps + steps
 # -------------------------------------------------------------#
 # print config keys, cool way to see the config
 config = {k: v for k, v in globals().items() if not k.startswith("__") and isinstance(v, (int, float, str, bool))}
@@ -42,39 +41,11 @@ for k,v in config.items():
     print(f"{k:<20}: {v}")
 # -------------------------------------------------------------#
 
-# -------------------------------------------------------------------------#
-# data loader (random data for profiling — no real dataset needed)
-# -------------------------------------------------------------------------#
-seed_offset = 0
-
-def get_random_batch(B, T, vocab_size, device):
-    """Generate a random batch of token IDs"""
-    x, y = (torch.randint(0, vocab_size, (B, T)) for _ in range(2))
-    if "cuda" in str(device):
-        x,y = map(lambda k: k.pin_memory().to(device, non_blocking=True), [x,y])
-    else:
-        x,y = map(lambda k: k.to(device), [x,y])
-    return x, y
-
-# -------------------------------------------------------------------------#
-
 
 # -------------------------------------------------------------#
-assert device in ["cuda", "mps", "cpu"], f"Invalid device: {device}"
-if device == "cuda" and torch.cuda.is_available():
-    device = "cuda"
-    device_type = 'cuda'
-elif device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-    device_type = 'mps'
-else:
-    device = "cpu"
-    device_type = 'cpu'
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available, this script requires a GPU to run.")
 print(f"Using device: {device}")
-
-
-# single GPU/CPU/MPS training
-device_type = 'cuda' if "cuda" in device else 'cpu'
 
 # set the seed
 torch.cuda.manual_seed(seed)
