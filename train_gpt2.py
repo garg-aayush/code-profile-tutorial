@@ -10,10 +10,7 @@ import time
 
 import numpy as np
 import torch
-# for ddp training 
-import torch.distributed as dist
 from model import GPT, GPTConfig
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -------------------------------------------------------------#
 # params
@@ -41,11 +38,6 @@ device = "cuda"        # device to use, "cuda" or "mps" or "cpu" (DDP only for "
 seed = 42              # seed for the random number generator
 
 use_compile = True    # use torch.compile to further speedup the model
-# H100 SXM: 989e12 flops (bf16)
-# H100 PCIe: 756e12 flops (bf16)
-# A100: 312e12 flops (bf16)
-# RTX6000 Ada: 364e12 flops (bf16)
-flops_promised = 989e12    # flops (bf16) promised by the gpu
 # -------------------------------------------------------------#
 # print config keys, cool way to see the config
 config = {k: v for k, v in globals().items() if not k.startswith("__") and isinstance(v, (int, float, str, bool))}
@@ -102,42 +94,21 @@ else:
 print(f"Using device: {device}")
 
 
-# setup DDP training
-# torchrun commands sets the env variables RANK, LOCAL_RANK, WORLD_SIZE
-# and we can use them to initialize the DDP
-ddp = int(os.environ.get("RANK", -1)) != -1 # if RANK is not -1, then we are using DDP
-if ddp:
-    dist.init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"]) # global rank
-    ddp_local_rank = int(os.environ["LOCAL_RANK"]) # local rank on a single node
-    ddp_world_size = int(os.environ["WORLD_SIZE"]) # total number of processes
-    device = f"cuda:{ddp_local_rank}"
-    device_type = 'cuda'
-    torch.cuda.set_device(ddp_local_rank)
-    master_process = ddp_rank == 0 # this process will do the printing, logging, checkpointing, etc.
-    seed_offset = ddp_rank
-    # sanity check
-    print(f"Using DDP with rank {ddp_rank}, local rank {ddp_local_rank}, world size {ddp_world_size} on device {device}")
-else:
-    # vanilla single GPU/CPU/MPS training
-    master_process = True
-    ddp_rank = 0
-    seed_offset = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
+# single GPU/CPU/MPS training
+device_type = 'cuda' if "cuda" in device else 'cpu'
 
-# set the seed, different for each process
-torch.cuda.manual_seed(seed + seed_offset)
-if device_type == "cuda":  # Fixed: only set CUDA seed if using CUDA
-    torch.cuda.manual_seed(seed + seed_offset)
+# set the seed
+torch.cuda.manual_seed(seed)
+if device_type == "cuda":
+    torch.cuda.manual_seed(seed)
 
 # use tf32
 torch.set_float32_matmul_precision("high")
 
 # get a data batch
 print("Calculate gradient accumulation steps...")
-assert total_batch % (B * T * ddp_world_size) == 0, f"Total batch size {total_batch} is not divisible by B*T*WORLD_SIZE={B * T * ddp_world_size}"
-grad_accum_steps = total_batch // (B * T * ddp_world_size)
+assert total_batch % (B * T) == 0, f"Total batch size {total_batch} is not divisible by B*T={B * T}"
+grad_accum_steps = total_batch // (B * T)
 print(f"Total desired batch size: {total_batch}")
 print(f"gradient accumulation steps: {grad_accum_steps}")
 
@@ -160,12 +131,7 @@ if use_compile:
     model = torch.compile(model)
 
 print("Moving model to device...")
-if ddp:
-    # pass ddp_local_rank to the model to ensure the model is moved to the correct device
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model
 
-running_mfu = -1.0
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
@@ -177,24 +143,12 @@ for step in range(max_steps):
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = get_random_batch(B, T, vocab_size, device)
-        if ddp:
-            # only synchronize on the final micro-step and all-reduce the loss_accum across all processes
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         # use bfloat16 for the model forward pass, supported on Ampere and above
-        # note since we are using bf16 and not f16, we don't need to use gradient scaler
-        # As bf16 has the same range as fp32
-        # Karpathy suggests to only refer to https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html#adding-torch-autocast
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
-        # we have to scale down the loss by the number of gradient accumulation steps 
-        # because the gradients just add up on each successive step (loss.backward())
-        # and we want mean instead of sum
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
-    if ddp:
-        # all-reduce the loss_accum across all processes
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     
     # global norm gradient clipping at 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm_clip)
@@ -212,13 +166,5 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1 - t0) * 1000 # convert to ms
     # tokens per second is a better metric than dt because it is independent of the batch size and sequence length
-    tokens_per_second = (B * T) * grad_accum_steps * ddp_world_size / (t1-t0)
-    if master_process and (step % log_interval == 0 or last_step):
-        if step > 5: # let the training loop stabilize
-            mfu = raw_model.estimate_mfu(grad_accum_steps * B, dt/1000, flops_promised)
-            # smooth the mfu (moving average)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"step: {step:04d}, loss: {loss_accum.item():.4f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/s: {tokens_per_second:.2f} | mfu: {running_mfu*100:.2f}%")
-            
-if ddp:
-    dist.destroy_process_group()
+    tokens_per_second = (B * T) * grad_accum_steps / (t1-t0)
+    print(f"step: {step:04d}, loss: {loss_accum.item():.4f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/s: {tokens_per_second:.2f}")
