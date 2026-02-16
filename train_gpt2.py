@@ -18,13 +18,10 @@ from model import GPT, GPTConfig
 log_interval = 1         # (steps) interval for logging
 grad_norm_clip = 1.0     # global norm gradient clipping
 # data
-total_batch = 524288    # 2^19, ~0.5M tokens, matching GPT-3 124M model
 B = 4                 # batch size
 T = 1024                # sequence length
 # optimizer hyperparameters
-max_lr = 1.5e-3           # maximum learning rate
-min_lr = max_lr * 0.1   # minimum learning rate
-warmup_steps = 10      # number of warmup steps, this is from original GPT-3 paper, and is too conservative, we can even go with like 100 steps
+max_lr = 1.5e-3           # constant learning rate
 max_steps = 100       # total number of steps, FineWeb-Edu 10B tokens (1 epoch training 10B/ 2^19)
 weight_decay = 0.1      # weight decay for optimizer
 betas = (0.9, 0.95)     # betas for optimizer
@@ -62,24 +59,6 @@ def get_random_batch(B, T, vocab_size, device):
 # -------------------------------------------------------------------------#
 
 
-# -------------------------------------------------------------------------#
-# helper functions
-# -------------------------------------------------------------------------
-
-# cosine decay learning-rate scheduler with warmup
-def get_lr(step):
-    # 1) linear warmup
-    if step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
-    # 2) if step > max_steps, return min_lr
-    if step > max_steps:
-        return min_lr
-    # 3) otherwise, use cosine decay
-    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
-
 # -------------------------------------------------------------#
 assert device in ["cuda", "mps", "cpu"], f"Invalid device: {device}"
 if device == "cuda" and torch.cuda.is_available():
@@ -105,16 +84,6 @@ if device_type == "cuda":
 # use tf32
 torch.set_float32_matmul_precision("high")
 
-# get a data batch
-print("Calculate gradient accumulation steps...")
-assert total_batch % (B * T) == 0, f"Total batch size {total_batch} is not divisible by B*T={B * T}"
-grad_accum_steps = total_batch // (B * T)
-print(f"Total desired batch size: {total_batch}")
-print(f"gradient accumulation steps: {grad_accum_steps}")
-
-# no data loader needed — using random batches for profiling
-
-
 # initialize the model
 print("Initializing model...")
 model_args = dict(vocab_size=vocab_size, n_layer=n_layer, n_embd=n_embd, n_head=n_head, block_size=T)
@@ -139,24 +108,18 @@ for step in range(max_steps):
     # training
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    # accumulate gradients over multiple steps
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = get_random_batch(B, T, vocab_size, device)
-        # use bfloat16 for the model forward pass, supported on Ampere and above
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
+    
+    x, y = get_random_batch(B, T, vocab_size, device)
+    # use bfloat16 for the model forward pass, supported on Ampere and above
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+    
+    loss.backward()
     
     # global norm gradient clipping at 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_norm_clip)
     
-    # determine and set the learning rate for the current step
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    # constant learning rate (max_lr)
     optimizer.step()
     
     # torch.cuda.synchronize() to ensure the GPU finishes before timing
@@ -166,5 +129,5 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1 - t0) * 1000 # convert to ms
     # tokens per second is a better metric than dt because it is independent of the batch size and sequence length
-    tokens_per_second = (B * T) * grad_accum_steps / (t1-t0)
-    print(f"step: {step:04d}, loss: {loss_accum.item():.4f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/s: {tokens_per_second:.2f}")
+    tokens_per_second = (B * T) / (t1-t0)
+    print(f"step: {step:04d}, loss: {loss.item():.4f} | lr: {max_lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f} ms | tok/s: {tokens_per_second:.2f}")
