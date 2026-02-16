@@ -1,0 +1,30 @@
+[project]
+name = "code-profile-tutorial"
+version = "0.1.0"
+description = "GPT-2 training benchmark and profiling tutorial"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch~=2.8.0",
+    "numpy",
+    "einops",
+    "matplotlib",
+    "seaborn",
+    "pandas",
+    "regex",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+include = ["utils"]
+
+[tool.uv]
+package = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
