@@ -7,6 +7,7 @@ import time
 
 import numpy as np
 import torch
+from contextlib import nullcontext
 from utils.model import GPT, GPTConfig
 from utils.data import get_random_batch
 
@@ -32,7 +33,9 @@ n_head = 12            # number of attention heads
 device = "cuda"        # device to use, "cuda" or "mps" or "cpu" (DDP only for "cuda")
 seed = 42              # seed for the random number generator
 device_type = "cuda"
-use_compile = False    # use torch.compile to further speedup the model
+use_compile = False     # use torch.compile to further speedup the model
+mixed_precision = False # use bfloat16 mixed precision
+use_tf32 = False         # use tf32 precision
 max_steps = warmup_steps + steps
 # -------------------------------------------------------------#
 # print config keys, cool way to see the config
@@ -49,11 +52,10 @@ print(f"Using device: {device}")
 
 # set the seed
 torch.cuda.manual_seed(seed)
-if device_type == "cuda":
-    torch.cuda.manual_seed(seed)
 
 # use tf32
-torch.set_float32_matmul_precision("high")
+if use_tf32:
+    torch.set_float32_matmul_precision("high")
 
 # initialize the model
 print("Initializing model...")
@@ -72,6 +74,10 @@ if use_compile:
 
 print("Moving model to device...")
 
+# mixed precision context
+print(f"Using mixed precision: {mixed_precision}")
+ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16) if mixed_precision else nullcontext()
+
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
@@ -81,10 +87,9 @@ for step in range(max_steps):
     optimizer.zero_grad(set_to_none=True)
     
     x, y = get_random_batch(B, T, vocab_size, device)
-    # use bfloat16 for the model forward pass, supported on Ampere and above
-    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
     
+    with ctx:
+        logits, loss = model(x, y)
     loss.backward()
     
     # global norm gradient clipping at 1.0
