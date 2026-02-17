@@ -1,0 +1,24 @@
+model:
+  size: medium
+  parameters: 312535008
+  parameters_millions: 312.54
+  size_mb: 1192.23
+  config:
+    n_layer: 24
+    n_embd: 1024
+    n_head: 16
+    vocab_size: 10000
+    block_size: 1024
+training:
+  batch_size: 4
+  sequence_length: 1024
+  warmup_steps: 2
+  measurement_steps: 10
+  seed: 42
+optimization:
+  mixed_precision: false
+  use_compile: false
+  use_tf32: false
+device:
+  type: cuda
+  name: NVIDIA GeForce RTX 4090
