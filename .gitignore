@@ -211,3 +211,4 @@ ckpt/
 
 # no pdf files
 **/*.pdf
+cs336-basics/*
